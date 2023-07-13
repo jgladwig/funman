@@ -2,26 +2,20 @@ import json
 import os
 import unittest
 from time import sleep
+from typing import Tuple
 
 import matplotlib.pyplot as plt
-from funman_demo.handlers import RealtimeResultPlotter, ResultCacheWriter
+import pydantic
 from funman_demo.parameter_space_plotter import ParameterSpacePlotter
 
+from funman.api.api import _wrap_with_internal_model
 from funman.api.settings import Settings
-from funman.funman import Funman, FUNMANConfig
+from funman.funman import FUNMANConfig
 from funman.model.generated_models.petrinet import Model as GeneratedPetrinet
 from funman.model.generated_models.regnet import Model as GeneratedRegnet
-from funman.model.petrinet import GeneratedPetriNetModel
-from funman.model.query import QueryLE, QueryTrue
-from funman.model.regnet import GeneratedRegnetModel
-from funman.scenario.parameter_synthesis import (
-    ParameterSynthesisScenario,
-    ParameterSynthesisScenarioResult,
-)
 from funman.server.query import FunmanWorkRequest, FunmanWorkUnit
 from funman.server.storage import Storage
 from funman.server.worker import FunmanWorker
-from funman.utils.handlers import ResultCombinedHandler
 
 RESOURCES = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "../resources"
@@ -30,20 +24,50 @@ RESOURCES = os.path.join(
 out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
 
 
-models = {
-    os.path.join(
-        RESOURCES, "common_model", "petrinet", "sir.json"
-    ): GeneratedPetrinet,
-    # os.path.join(
-    #     RESOURCES, "common_model", "petrinet", "sir_typed.json"
-    # ): GeneratedPetrinet,
-    os.path.join(
-        RESOURCES, "common_model", "regnet", "lotka_volterra.json"
-    ): GeneratedRegnet,
-    # os.path.join(
-    #     RESOURCES, "common_model", "regnet", "syntax_edge_cases.json"
-    # ): GeneratedRegnet,
-}
+models = {GeneratedPetrinet, GeneratedRegnet}
+
+AMR_EXAMPLES_DIR = os.path.join(RESOURCES, "amr")
+AMR_PETRI_DIR = os.path.join(AMR_EXAMPLES_DIR, "petrinet", "amr-examples")
+AMR_REGNET_DIR = os.path.join(AMR_EXAMPLES_DIR, "regnet", "amr-examples")
+
+SKEMA_PETRI_DIR = os.path.join(AMR_EXAMPLES_DIR, "petrinet", "skema")
+SKEMA_REGNET_DIR = os.path.join(AMR_EXAMPLES_DIR, "regnet", "skema")
+
+MIRA_PETRI_DIR = os.path.join(AMR_EXAMPLES_DIR, "petrinet", "mira")
+
+
+cases = [
+    # ok
+    # (
+    #     os.path.join(SKEMA_PETRI_DIR, "linked_petrinet.json"),
+    #     os.path.join(SKEMA_PETRI_DIR, "sir_request_skema1c.json"),
+    # ),
+    # ok
+    # (
+    #     os.path.join(SKEMA_PETRI_DIR, "linked_petrinet.json"),
+    #     os.path.join(SKEMA_PETRI_DIR, "sir_request_skema2.json"),
+    # ),
+    # (
+    #     os.path.join(AMR_PETRI_DIR, "sir.json"),
+    #     os.path.join(AMR_PETRI_DIR, "sir_request1b.json"),
+    # ),
+    # (
+    #     os.path.join(AMR_EXAMPLES_DIR, "sir.json"),
+    #     os.path.join(AMR_EXAMPLES_DIR, "sir_request2.json"),
+    # ),
+    # (
+    #     os.path.join(AMR_REGNET_DIR, "lotka_volterra.json"),
+    #     os.path.join(AMR_REGNET_DIR, "lotka_volterra_request_any1.json"),
+    # ),
+    # (
+    #     os.path.join(AMR_REGNET_DIR, "lotka_volterra.json"),
+    #     os.path.join(AMR_REGNET_DIR, "lotka_volterra_request1.json"),
+    # ),
+    (
+        os.path.join(MIRA_PETRI_DIR, "scenario1_a.json"),
+        os.path.join(MIRA_PETRI_DIR, "request1_a.json"),
+    ),
+]
 
 if not os.path.exists(out_dir):
     os.mkdir(out_dir)
@@ -58,51 +82,28 @@ class TestModels(unittest.TestCase):
         self._storage.start(self.settings.data_path)
         self._worker.start()
 
-        for model in models:
-            self.run_instance(model)
+        for case in cases:
+            self.run_instance(case)
 
         self._worker.stop()
         self._storage.stop()
 
-    def run_instance(self, model_file: str):
-        with open(model_file, "r") as f:
-            model_json = json.load(f)
-        generated_model = models[model_file].parse_raw(json.dumps(model_json))
+    def get_model(self, model_file: str):
+        for model in models:
+            try:
+                m = _wrap_with_internal_model(
+                    pydantic.parse_file_as(model, model_file)
+                )
+                return m
+            except Exception as e:
+                pass
+        raise Exception(f"Could not determine the Model type of {model_file}")
 
-        config = FUNMANConfig(
-            # solver="dreal",
-            # dreal_mcts=True,
-            tolerance=1e-8,
-            number_of_processes=1,
-            save_smtlib=True,
-            # dreal_log_level="debug",
-        )
+    def run_instance(self, case: Tuple[str, str]):
+        (model_file, request_file) = case
 
-        if isinstance(generated_model, GeneratedRegnet):
-            model = GeneratedRegnetModel(
-                regnet=generated_model,
-                structural_parameter_bounds={
-                    "num_steps": [2, 2],
-                    "step_size": [1, 1],
-                },
-            )
-            parameters = []
-            query = QueryLE(variable="W", ub=10)
-
-        elif isinstance(generated_model, GeneratedPetrinet):
-            model = GeneratedPetriNetModel(petrinet=generated_model)
-            parameters = []
-            query = QueryTrue()
-
-        request = FunmanWorkRequest(
-            query=query, parameters=parameters, config=config
-        )
-
-        # scenario = ParameterSynthesisScenario(
-        #     parameters=parameters,
-        #     model=model,
-        #     query=query,
-        # )
+        model = self.get_model(model_file)
+        request = pydantic.parse_file_as(FunmanWorkRequest, request_file)
 
         work_unit: FunmanWorkUnit = self._worker.enqueue_work(
             model=model, request=request
@@ -110,43 +111,28 @@ class TestModels(unittest.TestCase):
         sleep(2)  # need to sleep until worker has a chance to start working
         while True:
             if self._worker.is_processing_id(work_unit.id):
-                sleep(1)
+                results = self._worker.get_results(work_unit.id)
+                with open(f"{out_dir}/{work_unit.id}.json", "w") as f:
+                    f.write(json.dumps(results.json()))
+                # ParameterSpacePlotter(
+                #     results.parameter_space, plot_points=True
+                # ).plot(show=False)
+                # plt.savefig(f"{out_dir}/{model.__module__}.png")
+                # plt.close()
+                sleep(10)
             else:
                 results = self._worker.get_results(work_unit.id)
                 break
 
+        ParameterSpacePlotter(results.parameter_space, plot_points=True).plot(
+            show=False
+        )
+        plt.savefig(f"{out_dir}/{model.__module__}.png")
+        plt.close()
+
         assert results
 
-        ParameterSpacePlotter(results.parameter_space, plot_points=True).plot(
-            show=True
-        )
-        plt.savefig(f"{out_dir}/{model.name}.png")
-
         assert True
-
-        # result: ParameterSynthesisScenarioResult = Funman().solve(
-        #     scenario,
-        #     config=FUNMANConfig(
-        #         # solver="dreal",
-        #         # dreal_mcts=True,
-        #         tolerance=1e-8,
-        #         number_of_processes=1,
-        #         save_smtlib=True,
-        #         # dreal_log_level="debug",
-        #         _handler=ResultCombinedHandler(
-        #             [
-        #                 ResultCacheWriter(f"box_search.json"),
-        #                 RealtimeResultPlotter(
-        #                     scenario.parameters,
-        #                     plot_points=True,
-        #                     title=f"Feasible Regions (beta)",
-        #                     realtime_save_path=f"box_search.png",
-        #                 ),
-        #             ]
-        #         ),
-        #     ),
-        # )
-        # assert result
 
 
 if __name__ == "__main__":
